@@ -1,0 +1,43 @@
+states:
+  # list of state specifications
+  - name: foo  # state name, mandatory
+    initial: true
+    entry-actions: # optional list of entry-actions
+      - name: foo_exec  # action name, mandatory
+        variant: a  # action variant/parameter, optional. If specified, all actions of this name must specify a variant.
+      - name: foo_exec2 # another action name
+    exit-actions: # optional list of exit-actions
+      - name: foo_exec
+        variant: b
+    transitions: # either 'transitions' or 'states' must exist
+      - event: event1 # event that triggers the transition, mandatory
+        next: bar # target state for this transision, mandatory
+        action: # transition actions, optional
+          - name: foo_exec # mandatory
+            variant: c
+      - event: event2 # another transition from this state if 'event2' is received.
+        next: super
+  - name: bar
+    transitions:
+      - event: event3
+        next: foo
+        guards:
+          - name: is_empty
+            condition: true
+  - name: super # example of hierarchical state
+    exit: bar # what state to exit to if the hierarchical machine is done. Mandatory if 'states' exists.
+    states: # hierarchical state machine, can be arbitrarily nested.
+      - name: a
+        initial_if:
+          - name: is_empty
+            condition: false
+        transitions:
+          - event: event1
+            next: b
+      - name: b
+        initial_if:
+          - name: is_empty
+            condition: true
+        transitions:
+          - event: event1
+            next: exit # 'exit' is a special keywords that marks the completion of this state machine.
