@@ -29,6 +29,9 @@ pub struct Transition {
     pub guards: Option<Vec<GuardCondition>>,
 }
 
+/// All possible transitions associated to one source state + one event.
+pub type TransitionMap<'a> = HashMap<String, Vec<&'a Transition>>;
+
 /// A condition that guards a transition.
 #[derive(Debug, Deserialize)]
 pub struct GuardCondition {
@@ -91,8 +94,8 @@ impl State {
                     actions.merge(state.collect_actions());
                 }
             }
-            StateType::Leaf(transitions) => {
-                for t in transitions {
+            StateType::Leaf(..) => {
+                for t in self.transitions.as_ref().unwrap() {
                     if let Some(transition_actions) = &t.actions {
                         for action in transition_actions {
                             actions.register_action(action);
@@ -232,6 +235,17 @@ impl State {
                 unreachable!()
             }
         }
+    }
+
+    pub fn transition_map(&self) -> TransitionMap {
+        let mut transition_map = HashMap::new();
+        if let StateType::Leaf(transitions) = self.state_type() {
+            for t in transitions {
+                let entry = transition_map.entry(t.event.clone()).or_insert(Vec::new());
+                entry.push(t);
+            }
+        }
+        transition_map
     }
 
     /// Return 'true' if either initial is true or initial_if has some guard condition specified.
@@ -522,7 +536,7 @@ impl Hsm {
                     self.statig_state_fn(fsm_impl, substate, Some(&state.name));
                 }
             }
-            StateType::Leaf(transitions) => {
+            StateType::Leaf(..) => {
                 let attr: String = if let Some(s) = superstate {
                     format!(
                     "state(superstate = \"{}\", entry_action = \"{}_entry\", exit_action = \"{}_exit\")",
@@ -538,50 +552,83 @@ impl Hsm {
                 let state_fn = fsm_impl
                     .new_fn(&state.namespaced_name())
                     .attr(&attr)
-                    .arg_ref_self()
+                    .arg_mut_self()
                     .arg("event", "&Event")
                     .ret("Response<State>")
                     .line("match event {");
-                for t in transitions {
-                    state_fn.line(format!(
-                        "Event::{} => {{",
-                        t.event.to_case(Case::UpperCamel)
-                    ));
-                    let next_states = self.query_state(&state.namespace, &t.next);
+                for (event, transitions) in state.transition_map().iter() {
+                    state_fn.line(format!("Event::{} => {{", event.to_case(Case::UpperCamel)));
                     let mut make_default = false;
-                    for next in next_states {
-                        if let Some(initial) = next.initial() {
-                            match initial {
-                                InitialSpec::Always => {
+                    for t in transitions {
+                        if let Some(guards) = &t.guards {
+                            state_fn.line("if");
+                            state_fn.line(format!(
+                                "self.guards.{} == {}",
+                                guards[0].name, guards[0].condition
+                            ));
+                            for cond in &guards[1..] {
+                                state_fn.line(format!(
+                                    "&& self.guards.{} == {}",
+                                    cond.name, cond.condition
+                                ));
+                            }
+                            state_fn.line("{");
+                            make_default = true;
+                        }
+                        if let Some(actions) = &t.actions {
+                            for action in actions {
+                                if let Some(variant) = &action.variant {
+                                    let variant_typename = format!("{}_variant", action.name)
+                                        .to_case(Case::UpperCamel);
                                     state_fn.line(format!(
-                                        "return Response::Transition(State::{}())",
-                                        next.namespaced_name()
+                                        "self.actions.{}({}::{});",
+                                        action.name,
+                                        variant_typename,
+                                        variant.to_case(Case::UpperCamel)
                                     ));
-                                }
-                                InitialSpec::OnlyIf(guards) => {
-                                    state_fn.line("if");
-                                    state_fn.line(format!(
-                                        "self.guards.{} == {}",
-                                        guards[0].name, guards[0].condition
-                                    ));
-                                    for cond in &guards[1..] {
-                                        state_fn.line(format!(
-                                            "&& self.guards.{} == {}",
-                                            cond.name, cond.condition
-                                        ));
-                                    }
-                                    state_fn.line(format!(
-                                        "{{ return Response::Transition(State::{}()) }}",
-                                        next.namespaced_name()
-                                    ));
-                                    make_default = true;
+                                } else {
+                                    state_fn.line(format!("self.actions.{}();", action.name));
                                 }
                             }
-                        } else {
-                            state_fn.line(format!(
-                                "return Response::Transition(State::{}())",
-                                next.namespaced_name()
-                            ));
+                        }
+                        let next_states = self.query_state(&state.namespace, &t.next);
+                        for next in next_states {
+                            if let Some(initial) = next.initial() {
+                                match initial {
+                                    InitialSpec::Always => {
+                                        state_fn.line(format!(
+                                            "return Response::Transition(State::{}())",
+                                            next.namespaced_name()
+                                        ));
+                                    }
+                                    InitialSpec::OnlyIf(guards) => {
+                                        state_fn.line("if");
+                                        state_fn.line(format!(
+                                            "self.guards.{} == {}",
+                                            guards[0].name, guards[0].condition
+                                        ));
+                                        for cond in &guards[1..] {
+                                            state_fn.line(format!(
+                                                "&& self.guards.{} == {}",
+                                                cond.name, cond.condition
+                                            ));
+                                        }
+                                        state_fn.line(format!(
+                                            "{{ return Response::Transition(State::{}()) }}",
+                                            next.namespaced_name()
+                                        ));
+                                        make_default = true;
+                                    }
+                                }
+                            } else {
+                                state_fn.line(format!(
+                                    "return Response::Transition(State::{}())",
+                                    next.namespaced_name()
+                                ));
+                            }
+                        }
+                        if t.guards.is_some() {
+                            state_fn.line("}"); // close guards 'if' clause
                         }
                     }
                     // default needed for guarded transitions in case no guard evaluates to 'true'.
@@ -642,13 +689,16 @@ impl Hsm {
         output.import("statig", "Response");
         let guards = output
             .new_struct("Guards")
+            .vis("pub")
             .derive("Debug")
             .derive("Clone")
             .derive("Copy")
             .derive("PartialEq")
             .derive("Eq");
         for guard in self.guards() {
-            guards.field(&guard, "bool");
+            let mut field = codegen::Field::new(&guard, "bool");
+            field.vis("pub");
+            guards.push_field(field);
         }
         let mut actions = codegen::Trait::new("Actions");
         actions.vis("pub");
@@ -659,6 +709,7 @@ impl Hsm {
                 func.arg("variant", variant_typename.clone());
                 let variant_enum = output
                     .new_enum(variant_typename)
+                    .vis("pub")
                     .derive("Debug")
                     .derive("Clone")
                     .derive("Copy")
