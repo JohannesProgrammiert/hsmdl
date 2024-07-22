@@ -1,3 +1,8 @@
+//! # Hierarchical State Machine Description Language (HSMDL)
+//!
+//! Parses a HSMDL YAML into Rust objects.
+//!
+//! Use Hsm::emit_statig() to generate 'statig' Rust code that corresponds the specified state machine.
 use codegen::Scope;
 use convert_case::{Case, Casing};
 use serde::Deserialize;
@@ -6,12 +11,16 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+/// Action specification.
 #[derive(Debug, Deserialize)]
 pub struct Action {
     pub name: String,
     pub variant: Option<String>,
 }
 
+/// Transition from a state to another.
+///
+/// A 'Transition'-object is owned by the source 'State'-object.
 #[derive(Debug, Deserialize)]
 pub struct Transition {
     pub event: String,
@@ -20,18 +29,21 @@ pub struct Transition {
     pub guards: Option<Vec<GuardCondition>>,
 }
 
+/// A condition that guards a transition.
 #[derive(Debug, Deserialize)]
 pub struct GuardCondition {
     pub name: String,
     pub condition: bool,
 }
 
+/// A state may always be the initial state of its super-state or only if some condition is fulfilled.
 #[derive(Debug, Clone)]
 pub enum InitialSpec<'a> {
     Always,
     OnlyIf(&'a Vec<GuardCondition>),
 }
 
+/// Separates state into hierarchical and leaf/simple states.
 #[derive(Debug, Clone)]
 pub enum StateType<'a> {
     Hierarchical {
@@ -41,11 +53,13 @@ pub enum StateType<'a> {
     Leaf(&'a Vec<Transition>),
 }
 
+/// Specification of a state.
 #[derive(Debug, Deserialize)]
 pub struct State {
     pub name: String,
+    /// Namespace is used to track the state hierarchy.
     #[serde(skip)]
-    pub namespaced_name: String,
+    pub namespace: String,
     initial: Option<bool>,
     initial_if: Option<Vec<GuardCondition>>,
     #[serde(rename = "entry-actions", default)]
@@ -90,6 +104,11 @@ impl State {
         actions
     }
 
+    /// Return namespaced name of this state.
+    pub fn namespaced_name(&self) -> String {
+        format!("{}{}", self.namespace, self.name)
+    }
+
     /// Collect all guard conditions that occur in transitions and initial_if of this state and sub-states.
     pub fn collect_guards(&self) -> HashSet<&String> {
         let mut collected_guards = HashSet::new();
@@ -121,6 +140,47 @@ impl State {
         collected_guards
     }
 
+    /// Find a state whose namespaced_name matches the specified one.
+    pub fn query_state(&self, namespaced_name: &str) -> Option<&State> {
+        if self.namespaced_name() == namespaced_name {
+            return Some(&self);
+        }
+        match self.state_type() {
+            StateType::Hierarchical { states, .. } => {
+                for substate in states {
+                    if let Some(s) = substate.query_state(namespaced_name) {
+                        return Some(s);
+                    }
+                }
+                return None;
+            }
+            StateType::Leaf(..) => {
+                return None;
+            }
+        }
+    }
+
+    /// Return all occurring events.
+    pub fn collect_events(&self) -> HashSet<&String> {
+        let mut collected_events = HashSet::new();
+        match self.state_type() {
+            StateType::Hierarchical { states, .. } => {
+                for substate in states {
+                    for g in substate.collect_events() {
+                        collected_events.insert(g);
+                    }
+                }
+            }
+            StateType::Leaf(transitions) => {
+                for t in transitions {
+                    collected_events.insert(&t.event);
+                }
+            }
+        }
+        collected_events
+    }
+
+    /// Return whether this state is the 'initial' state of the superstate.
     pub fn initial(&self) -> Option<InitialSpec> {
         if let Some(initial_conds) = &self.initial_if {
             Some(InitialSpec::OnlyIf(&initial_conds))
@@ -132,6 +192,28 @@ impl State {
             }
         } else {
             None
+        }
+    }
+
+    /// For superstates, return initial sub states.
+    /// For leaf states, this simply returns itself.
+    pub fn initial_states(&self) -> Vec<&State> {
+        match self.state_type() {
+            StateType::Hierarchical { states, .. } => {
+                let mut initial_states = Vec::new();
+                for state in states {
+                    if let Some(initial_spec) = state.initial() {
+                        match initial_spec {
+                            InitialSpec::Always => return vec![state],
+                            InitialSpec::OnlyIf(..) => initial_states.push(state),
+                        }
+                    }
+                }
+                initial_states
+            }
+            StateType::Leaf(..) => {
+                vec![&self]
+            }
         }
     }
 
@@ -223,7 +305,6 @@ pub struct ActionMap {
 }
 
 impl ActionMap {
-    // const NONE: Self = Self { name: String::new(),  };
     /// Create action spec
     fn new() -> Self {
         Self {
@@ -286,12 +367,14 @@ pub enum HsmParserError {
     InvalidKey((String, String)),
 }
 
+/// The main handle that holds information about states.
 #[derive(Debug, Deserialize)]
 pub struct Hsm {
     pub states: Vec<State>,
 }
 
 impl Hsm {
+    /// Initialize from YAML specification.
     pub fn from_yaml_file(file_path: impl AsRef<Path>) -> Result<Hsm, HsmParserError> {
         let mut file = File::open(file_path).map_err(|e| HsmParserError::OpenFile(e))?;
         let mut contents = String::new();
@@ -314,6 +397,8 @@ impl Hsm {
         }
         actions
     }
+
+    /// Return all occuring guard names.
     fn guards(&self) -> HashSet<String> {
         let mut guards = HashSet::new();
         for state in &self.states {
@@ -322,6 +407,17 @@ impl Hsm {
             }
         }
         guards
+    }
+
+    /// Return all occurring events.
+    fn events(&self) -> HashSet<String> {
+        let mut events = HashSet::new();
+        for state in &self.states {
+            for e in state.collect_events() {
+                events.insert(e.clone());
+            }
+        }
+        events
     }
 
     /// Return reference to initial state of state machine.
@@ -356,61 +452,150 @@ impl Hsm {
 
     /// Populate the state.namespace_name fields by tracking the hierarchy.
     fn resolve_namespaces(state: &mut State) {
-        if state.namespaced_name == "" {
-            state.namespaced_name = state.name.clone();
-        }
         if let Some(sub_states) = &mut state.states {
             for sub_state in sub_states {
-                sub_state.namespaced_name = format!("{}_{}", state.name, sub_state.name);
+                sub_state.namespace = format!("{}{}_", state.namespace, state.name);
                 Self::resolve_namespaces(sub_state);
             }
         }
     }
 
-    /// Generate a state method as expected by the 'statig' crate.
-    fn statig_state_fn(fsm_impl: &mut codegen::Impl, state: &State, superstate: Option<&String>) {
-        if let Some(substates) = &state.states {
-            let attr: String = if let Some(s) = superstate {
-                format!(
-                    "superstate(superstate = \"{}\", entry_action = \"{}_entry\", exit_action = \"{}_exit\")",
-                    s, state.namespaced_name, state.namespaced_name
-                )
+    /// Find a state in the specified namespace.
+    ///
+    /// To find a state as top-level, set `namespace` to "".
+    ///
+    /// In case the specified state in "exit", the superstates's "exit"-state is returned
+    /// In case the found state is a super-state, the initial states are returned.
+    ///
+    /// This used to resolve the 'next' field in transitions to a State object.
+    fn query_state(&self, namespace: &str, name: &str) -> Vec<&State> {
+        let mut result = Vec::new();
+        for state in &self.states {
+            if name == "exit" {
+                if let Some(s) = state.query_state(&namespace[..namespace.len() - 1]) {
+                    let exit_state = self.query_state(&s.namespace, s.exit.as_ref().unwrap())[0];
+                    result.extend(exit_state.initial_states());
+                    break;
+                }
             } else {
-                format!(
-                    "superstate(entry_action = \"{}_entry\", exit_action = \"{}_exit\")",
-                    state.namespaced_name, state.namespaced_name
-                )
-            };
-            fsm_impl
-                .new_fn(&state.namespaced_name)
-                .attr(&attr)
-                .arg_ref_self()
-                .arg("event", "&Event")
-                .ret("Response<State>");
-            for substate in substates {
-                Self::statig_state_fn(fsm_impl, substate, Some(&state.name));
+                let query = &format!("{}{}", namespace, name);
+                if let Some(s) = state.query_state(query) {
+                    result.extend(s.initial_states());
+                    break;
+                }
             }
-        } else {
-            let attr: String = if let Some(s) = superstate {
-                format!(
+        }
+        result
+    }
+
+    /// Generate a state method as expected by the 'statig' crate.
+    fn statig_state_fn(
+        &self,
+        fsm_impl: &mut codegen::Impl,
+        state: &State,
+        superstate: Option<&String>,
+    ) {
+        match state.state_type() {
+            StateType::Hierarchical { states, .. } => {
+                let attr: String = if let Some(s) = superstate {
+                    format!(
+                    "superstate(superstate = \"{}\", entry_action = \"{}_entry\", exit_action = \"{}_exit\")",
+                    s, state.namespaced_name(), state.namespaced_name()
+                )
+                } else {
+                    format!(
+                        "superstate(entry_action = \"{}_entry\", exit_action = \"{}_exit\")",
+                        state.namespaced_name(),
+                        state.namespaced_name()
+                    )
+                };
+                fsm_impl
+                    .new_fn(&state.namespaced_name())
+                    .attr(&attr)
+                    .arg_ref_self()
+                    .arg("event", "&Event")
+                    .ret("Response<State>")
+                    .line("match event {")
+                    .line("_ => return Response::Handled,")
+                    .line("}");
+                for substate in states {
+                    self.statig_state_fn(fsm_impl, substate, Some(&state.name));
+                }
+            }
+            StateType::Leaf(transitions) => {
+                let attr: String = if let Some(s) = superstate {
+                    format!(
                     "state(superstate = \"{}\", entry_action = \"{}_entry\", exit_action = \"{}_exit\")",
-                    s, state.namespaced_name, state.namespaced_name
+                    s, state.namespaced_name(), state.namespaced_name()
                 )
-            } else {
-                format!(
-                    "state(entry_action = \"{}_entry\", exit_action = \"{}_exit\")",
-                    state.namespaced_name, state.namespaced_name
-                )
-            };
-            fsm_impl
-                .new_fn(&state.namespaced_name)
-                .attr(&attr)
-                .arg_ref_self()
-                .arg("event", "&Event")
-                .ret("Response<State>");
+                } else {
+                    format!(
+                        "state(entry_action = \"{}_entry\", exit_action = \"{}_exit\")",
+                        state.namespaced_name(),
+                        state.namespaced_name()
+                    )
+                };
+                let state_fn = fsm_impl
+                    .new_fn(&state.namespaced_name())
+                    .attr(&attr)
+                    .arg_ref_self()
+                    .arg("event", "&Event")
+                    .ret("Response<State>")
+                    .line("match event {");
+                for t in transitions {
+                    state_fn.line(format!(
+                        "Event::{} => {{",
+                        t.event.to_case(Case::UpperCamel)
+                    ));
+                    let next_states = self.query_state(&state.namespace, &t.next);
+                    let mut make_default = false;
+                    for next in next_states {
+                        if let Some(initial) = next.initial() {
+                            match initial {
+                                InitialSpec::Always => {
+                                    state_fn.line(format!(
+                                        "return Response::Transition(State::{}())",
+                                        next.namespaced_name()
+                                    ));
+                                }
+                                InitialSpec::OnlyIf(guards) => {
+                                    state_fn.line("if");
+                                    state_fn.line(format!(
+                                        "self.guards.{} == {}",
+                                        guards[0].name, guards[0].condition
+                                    ));
+                                    for cond in &guards[1..] {
+                                        state_fn.line(format!(
+                                            "&& self.guards.{} == {}",
+                                            cond.name, cond.condition
+                                        ));
+                                    }
+                                    state_fn.line(format!(
+                                        "{{ return Response::Transition(State::{}()) }}",
+                                        next.namespaced_name()
+                                    ));
+                                    make_default = true;
+                                }
+                            }
+                        } else {
+                            state_fn.line(format!(
+                                "return Response::Transition(State::{}())",
+                                next.namespaced_name()
+                            ));
+                        }
+                    }
+                    // default needed for guarded transitions in case no guard evaluates to 'true'.
+                    if make_default {
+                        state_fn.line("return Response::Handled;");
+                    }
+                    state_fn.line(format!("}},"));
+                }
+                state_fn.line("_ => Response::Handled,").line("}");
+            }
         }
         let entry_fn = fsm_impl
-            .new_fn(&format!("{}_entry", state.namespaced_name))
+            .new_fn(&format!("{}_entry", state.namespaced_name()))
+            .attr("action")
             .arg_mut_self();
         if let Some(entry_actions) = &state.entry_actions {
             for action in entry_actions {
@@ -429,7 +614,8 @@ impl Hsm {
             }
         }
         let exit_fn = fsm_impl
-            .new_fn(&format!("{}_exit", state.namespaced_name))
+            .new_fn(&format!("{}_exit", state.namespaced_name()))
+            .attr("action")
             .arg_mut_self();
         if let Some(exit_actions) = &state.exit_actions {
             for action in exit_actions {
@@ -449,9 +635,11 @@ impl Hsm {
         }
     }
 
+    /// Generate 'statig' state machine code that corresponds the state machine specified in the YAML file.
     pub fn emit_statig(&self) -> String {
         let mut output = Scope::new();
-        output.import("statig::prelude", "*");
+        output.import("statig", "state_machine");
+        output.import("statig", "Response");
         let guards = output
             .new_struct("Guards")
             .derive("Debug")
@@ -463,12 +651,19 @@ impl Hsm {
             guards.field(&guard, "bool");
         }
         let mut actions = codegen::Trait::new("Actions");
+        actions.vis("pub");
         for (action_name, action_type) in self.actions().map.iter() {
-            let func = actions.new_fn(action_name);
+            let func = actions.new_fn(action_name).arg_mut_self();
             if let ActionType::Parametrized { variants } = &action_type {
                 let variant_typename = format!("{}_variant", action_name).to_case(Case::UpperCamel);
                 func.arg("variant", variant_typename.clone());
-                let variant_enum = output.new_enum(variant_typename);
+                let variant_enum = output
+                    .new_enum(variant_typename)
+                    .derive("Debug")
+                    .derive("Clone")
+                    .derive("Copy")
+                    .derive("PartialEq")
+                    .derive("Eq");
                 for var in variants {
                     variant_enum.new_variant(var.to_case(Case::UpperCamel));
                 }
@@ -477,18 +672,42 @@ impl Hsm {
         output.push_trait(actions);
         output
             .new_struct("Fsm")
+            .vis("pub")
+            .generic("T")
+            .bound("T", "Actions")
             .derive("Debug")
-            .derive("Default")
             .field("guards", "Guards")
-            .field("actions", "Actions");
-        let fsm_impl = output.new_impl("Fsm").r#macro(&format!(
-            "#[state_machine(initial = \"{}\")]",
-            self.initial().name
-        ));
+            .field("actions", "T");
+        let fsm_impl = output
+            .new_impl("Fsm")
+            .r#macro(&format!(
+                "#[state_machine(initial = \"State::{}()\")]",
+                self.initial().name
+            ))
+            .generic("T")
+            .bound("T", "Actions")
+            .target_generic("T");
+        fsm_impl
+            .new_fn("new")
+            .vis("pub")
+            .arg("guards", "Guards")
+            .arg("actions", "T")
+            .ret("Self")
+            .line("Self { guards, actions }");
         for state in &self.states {
-            Self::statig_state_fn(fsm_impl, state, None);
+            self.statig_state_fn(fsm_impl, state, None);
         }
-
+        let events = output
+            .new_enum("Event")
+            .vis("pub")
+            .derive("Debug")
+            .derive("PartialEq")
+            .derive("Eq")
+            .derive("Clone")
+            .derive("Copy");
+        for event in self.events() {
+            events.push_variant(codegen::Variant::new(event.to_case(Case::UpperCamel)));
+        }
         output.to_string()
     }
 }
@@ -500,7 +719,6 @@ mod tests {
     #[test]
     fn it_works() {
         let hsm = Hsm::from_yaml_file("test.yaml").expect("YAML deser failed");
-        println!("{:?}", hsm);
         let statig = hsm.emit_statig();
         println!("{}", statig);
     }
