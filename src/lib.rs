@@ -27,6 +27,9 @@ pub struct Transition {
     pub next: String,
     pub actions: Option<Vec<Action>>,
     pub guards: Option<Vec<GuardCondition>>,
+    #[serde(rename = "timing-constraint", default)]
+    pub timing_constraint: Option<String>,
+    pub description: Option<String>,
 }
 
 /// All possible transitions associated to one source state + one event.
@@ -37,6 +40,24 @@ pub type TransitionMap<'a> = HashMap<String, Vec<&'a Transition>>;
 pub struct GuardCondition {
     pub name: String,
     pub condition: bool,
+}
+
+impl GuardCondition {
+    pub fn to_uml(&self) -> String {
+        let cond = if self.condition { "" } else { "not " };
+        format!("{}{}", cond, self.name)
+    }
+}
+
+pub fn guard_conditions_to_uml(conds: &Vec<GuardCondition>) -> String {
+    let mut ret = String::new();
+    if conds.len() >= 1 {
+        ret = conds[0].to_uml();
+    }
+    for i in 1..conds.len() {
+        ret = format!("{} && {}", ret, conds[i].to_uml());
+    }
+    ret
 }
 
 /// A state may always be the initial state of its super-state or only if some condition is fulfilled.
@@ -237,11 +258,24 @@ impl State {
         }
     }
 
-    pub fn transition_map(&self) -> TransitionMap {
+    /// Get transitions unique by event type.
+    pub fn transition_map_event(&self) -> TransitionMap {
         let mut transition_map = HashMap::new();
         if let StateType::Leaf(transitions) = self.state_type() {
             for t in transitions {
                 let entry = transition_map.entry(t.event.clone()).or_insert(Vec::new());
+                entry.push(t);
+            }
+        }
+        transition_map
+    }
+
+    /// Get transitions unique by next state.
+    pub fn transition_map_dest(&self) -> TransitionMap {
+        let mut transition_map = HashMap::new();
+        if let StateType::Leaf(transitions) = self.state_type() {
+            for t in transitions {
+                let entry = transition_map.entry(t.next.clone()).or_insert(Vec::new());
                 entry.push(t);
             }
         }
@@ -291,6 +325,83 @@ impl State {
             }
         }
         Ok(())
+    }
+    fn emit_puml(&self) -> Vec<String> {
+        let mut ret = Vec::new();
+        if let Some(i) = self.initial() {
+            match i {
+                InitialSpec::Always => {
+                    ret.push(format!("[*] --> {}", self.name.to_case(Case::UpperSnake)));
+                }
+                InitialSpec::OnlyIf(g) => {
+                    ret.push(format!(
+                        "[*] --> {} : {}",
+                        self.name.to_case(Case::UpperSnake),
+                        guard_conditions_to_uml(g)
+                    ));
+                }
+            }
+        }
+        match self.state_type() {
+            StateType::Hierarchical { states: _, exit } => {
+                // sub-self machines have only one transition: the one that appears under 'exit'
+                ret.push(format!(
+                    "{} --> {}",
+                    self.name.to_case(Case::UpperSnake),
+                    exit.to_case(Case::UpperSnake)
+                ));
+            }
+            StateType::Leaf(_) => {
+                for transition in self.transition_map_dest() {
+                    if transition.0 == "exit" {
+                        ret.push(format!(
+                            "{} --> [*] : {}",
+                            self.name.to_case(Case::UpperSnake),
+                            transition.1[0].event,
+                        ));
+                    } else {
+                        ret.push(format!(
+                            "{} --> {} : {}",
+                            self.name.to_case(Case::UpperSnake),
+                            transition.0.to_case(Case::UpperSnake),
+                            transition.1[0].event
+                        ));
+                    }
+                    if let Some(c) = &transition.1[0].timing_constraint {
+                        // timing constraint marker.
+                        ret.push("note on link".into());
+                        ret.push(format!("     ! ${}", c));
+                        ret.push("end note".into());
+                    }
+                }
+            }
+        }
+        if let Some(entry_actions) = &self.entry_actions {
+            for action in entry_actions {
+                ret.push(format!(
+                    "{} : Entry: {}",
+                    self.name.to_case(Case::UpperSnake),
+                    action.name
+                ))
+            }
+        }
+        if let Some(exit_actions) = &self.exit_actions {
+            for action in exit_actions {
+                ret.push(format!(
+                    "{} : Exit: {}",
+                    self.name.to_case(Case::UpperSnake),
+                    action.name
+                ))
+            }
+        }
+        if let StateType::Hierarchical { states, .. } = self.state_type() {
+            ret.push(format!("state {} {{", self.name.to_case(Case::UpperSnake)));
+            for s in states {
+                ret.extend(s.emit_puml());
+            }
+            ret.push("}".into());
+        }
+        ret
     }
 }
 
@@ -556,7 +667,7 @@ impl Hsm {
                     .arg("event", "&Event")
                     .ret("Response<State>")
                     .line("match event {");
-                for (event, transitions) in state.transition_map().iter() {
+                for (event, transitions) in state.transition_map_event().iter() {
                     state_fn.line(format!("Event::{} => {{", event.to_case(Case::UpperCamel)));
                     let mut make_default = false;
                     for t in transitions {
@@ -680,6 +791,19 @@ impl Hsm {
                 }
             }
         }
+    }
+
+    pub fn emit_puml(&self, caption: &str) -> String {
+        let mut ret = Vec::new();
+        ret.push("DO NOT EDIT: Automatically generated".into());
+        ret.push("@startuml diagram".into());
+        ret.push("scale 1920 width".into());
+        ret.push(format!("caption {}", caption));
+        for state in &self.states {
+            ret.extend(state.emit_puml());
+        }
+        ret.push("@enduml".into());
+        ret.join("\n")
     }
 
     /// Generate 'statig' state machine code that corresponds the state machine specified in the YAML file.
